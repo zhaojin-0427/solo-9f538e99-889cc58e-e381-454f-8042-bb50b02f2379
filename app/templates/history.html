@@ -1,0 +1,115 @@
+{% extends "base.html" %}
+{% block title %}历史回溯查询{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>历史回溯查询</h2>
+  <p class="muted">按 <strong>站点 + UTC 整点小时 + 批次号</strong> 查询某次上传完成后实际可用的小时雨量。
+    计算沿用与实时查询相同的主备取值、10000 回绕与缺口规则，并逐段展示当时的数据来源。</p>
+  {% if meta %}
+  <p>状态：<span class="badge ok">已启用</span>
+     启用时间 (UTC)：{{ meta.enabled_at }} ｜ 历史起点批次：#{{ meta.baseline_batch_id }}
+     （启用时以当时全部有效读数建立快照起点）</p>
+  <p class="muted">每个被接受的批次提交后，其查询结果即被冻结；后续上传、失败或重启都不会改写。
+     批次号小于 #{{ meta.baseline_batch_id }} 的启用前旧批次无法回溯。</p>
+  {% else %}
+  <p>状态：<span class="badge warn">未启用</span>
+     启用后才可以按批次回溯；启用时将以当前全部有效读数建立历史起点，启用前的旧批次无法回溯。</p>
+  <form method="post" action="{{ url_for('history_enable_html') }}">
+    <button type="submit">启用历史回溯</button>
+  </form>
+  {% endif %}
+</div>
+
+<div class="card">
+  <h2>查询条件</h2>
+  <form method="get" action="{{ url_for('history_html') }}">
+    <p>
+      <label>站点
+        <input type="text" name="station" required value="{{ form.station }}" list="station-list">
+      </label>
+      <label>整点小时（UTC）
+        <input type="datetime-local" name="hour" step="3600" required value="{{ form.hour }}">
+      </label>
+      <label>批次号
+        <input type="number" name="batch" min="1" step="1" required value="{{ form.batch }}">
+      </label>
+      <button type="submit">查询历史结果</button>
+    </p>
+    <datalist id="station-list">
+      {% for s in stations %}<option value="{{ s.station }}">{% endfor %}
+    </datalist>
+  </form>
+  <p class="muted">等效 API：<code>GET /api/history?station=站点&amp;hour=2026-11-17T10:00Z&amp;batch=3</code>
+    （与网页同一计算入口，返回一致结果）；启用状态：<code>GET /api/history/status</code></p>
+</div>
+
+{% if error %}
+<div class="flash error">{{ error }}</div>
+{% endif %}
+
+{% if result %}
+<div class="card">
+  <h2>批次 #{{ result.batch_id }} 提交后的小时雨量：{{ result.station }} @ {{ result.hour_start }}</h2>
+  {% if result.status == "ok" %}
+  <p>状态：<span class="badge ok">可供数</span>
+     雨量 <strong>{{ "%.1f"|format(result.rainfall_mm) }} mm</strong>
+     （共 {{ result.total_pulses }} 脉冲 × 0.2 mm）</p>
+  {% else %}
+  <p>状态：<span class="badge bad">不可供数</span>
+     缺口 {{ result.missing_intervals }} / 60 个间隔（已覆盖 {{ result.available_pulses }} 脉冲，仅供参考，不供数）</p>
+  {% endif %}
+  <p class="muted">间隔来源：主计 {{ result.source_counts.primary }} 段 ｜
+     备计 {{ result.source_counts.backup }} 段 ｜ 缺失 {{ result.source_counts.missing }} 段</p>
+  <p class="muted">本结果基于批次 #{{ result.batch_id }} 提交时的不可变快照还原：
+     {{ result.history.note }}。历史起点批次 #{{ result.history.baseline_batch_id }}
+     （{{ result.history.enabled_at }}）。</p>
+  <p>
+    <a href="{{ url_for('history_api', station=result.station, hour=result.hour_start, batch=result.batch_id) }}">查看 JSON</a>
+  </p>
+</div>
+
+<div class="card">
+  <table>
+    <tr><th>#</th><th>间隔 (UTC)</th><th>来源</th><th>脉冲</th><th>雨量 (mm)</th></tr>
+    {% for it in result.intervals %}
+    <tr class="{{ 'missing' if it.source == 'missing' else '' }}">
+      <td>{{ it.index + 1 }}</td>
+      <td>{{ it.start }} ~ {{ it.end }}</td>
+      <td>
+        {% if it.source == "primary" %}<span class="badge ok">主计</span>
+        {% elif it.source == "backup" %}<span class="badge warn">备计</span>
+        {% else %}<span class="badge bad">缺失</span>{% endif %}
+      </td>
+      <td>{{ it.pulses if it.pulses is not none else "—" }}</td>
+      <td>{{ "%.1f"|format(it.rainfall_mm) if it.rainfall_mm is not none else "—" }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>批次列表</h2>
+  {% if batches %}
+  <table>
+    <tr><th>批次</th><th>时间 (UTC)</th><th>文件名</th><th>接受</th><th>拒绝</th><th>可回溯</th><th></th></tr>
+    {% for b in batches %}
+    <tr>
+      <td>#{{ b.batch_id }}</td><td>{{ b.uploaded_at }}</td><td>{{ b.filename or "（粘贴文本）" }}</td>
+      <td>{{ b.accepted_rows }}</td><td>{{ b.rejected_rows }}</td>
+      <td>{% if b.history_queryable %}<span class="badge ok">可回溯</span>
+          {% elif meta %}<span class="badge bad">启用前旧批次</span>
+          {% else %}<span class="badge warn">未启用</span>{% endif %}</td>
+      <td>
+        <a href="{{ url_for('batch_detail', batch_id=b.batch_id) }}">明细</a>
+        {% if b.history_queryable and form.station and form.hour %}
+        ｜ <a href="{{ url_for('history_html', station=form.station, hour=form.hour, batch=b.batch_id) }}">以此批查询</a>
+        {% endif %}
+      </td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">暂无批次。</p>{% endif %}
+</div>
+<p><a href="{{ url_for('index') }}">返回首页</a></p>
+{% endblock %}

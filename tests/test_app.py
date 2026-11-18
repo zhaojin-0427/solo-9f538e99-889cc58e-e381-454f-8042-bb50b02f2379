@@ -347,5 +347,225 @@ class AppTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 400)
 
 
+class HistoryTests(unittest.TestCase):
+    """历史回溯：启用起点、同批最终值、不可变快照、网页/API 一致、旧批次拒绝。"""
+
+    HOUR = "2026-11-17T10:00Z"
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.path = os.path.join(self.dir, "history.db")
+        self.app = create_app(self.path)
+        self.client = self.app.test_client()
+
+    def _upload(self, text):
+        return self.client.post("/api/upload", data={"csv_text": text})
+
+    def _full_hour_csv(self, station, base, revision=1):
+        """一整个完整小时的主计读数，每分钟 +1 脉冲（60 脉冲 = 12.0 mm）。"""
+        return "\n".join(
+            csv_rows(station, "primary", T10, [base + i for i in range(61)], revision)
+        )
+
+    def _enable(self):
+        return self.client.post("/api/history/enable")
+
+    def _history(self, station, hour, batch):
+        resp = self.client.get(f"/api/history?station={station}&hour={hour}&batch={batch}")
+        return resp.status_code, resp.get_json()
+
+    def test_disabled_by_default_and_pre_enable_batch_not_queryable(self):
+        self.assertEqual(self.client.get("/api/history/status").get_json(), {"enabled": False})
+        rep = self._upload(self._full_hour_csv("S1", 1000)).get_json()
+        batch_before = rep["batch_id"]
+
+        # 未启用时任何历史查询都被拒绝（网页与 API 一致）
+        status, body = self._history("S1", self.HOUR, batch_before)
+        self.assertEqual(status, 409)
+        self.assertIn("尚未启用", body["error"])
+        html = self.client.get(
+            f"/history?station=S1&hour={self.HOUR}&batch={batch_before}"
+        ).get_data(as_text=True)
+        self.assertIn("尚未启用", html)
+
+        # 启用后旧批次仍明确无法回溯
+        info = self._enable().get_json()
+        self.assertFalse(info["already_enabled"])
+        baseline = info["baseline_batch_id"]
+        self.assertGreater(baseline, batch_before)
+        status, body = self._history("S1", self.HOUR, batch_before)
+        self.assertEqual(status, 409)
+        self.assertIn("启用前的旧批次，无法回溯", body["error"])
+        html = self.client.get(
+            f"/history?station=S1&hour={self.HOUR}&batch={batch_before}"
+        ).get_data(as_text=True)
+        self.assertIn("无法回溯", html)
+
+    def test_enable_baseline_snapshots_current_readings(self):
+        self._upload(self._full_hour_csv("S1", 1000))
+        info = self._enable().get_json()
+        self.assertEqual(info["snapshot_readings"], 61)
+        # 起点批次本身可查询，结果等于启用时的现算结果
+        status, r = self._history("S1", self.HOUR, info["baseline_batch_id"])
+        self.assertEqual(status, 200)
+        self.assertEqual(r["status"], "ok")
+        self.assertEqual(r["rainfall_mm"], 12.0)
+        self.assertEqual(r["batch_id"], info["baseline_batch_id"])
+        self.assertIn("history", r)
+
+    def test_enable_is_idempotent_and_baseline_immutable(self):
+        self._upload(self._full_hour_csv("S1", 1000))
+        first = self._enable().get_json()
+        again = self._enable().get_json()
+        self.assertTrue(again["already_enabled"])
+        self.assertEqual(again["baseline_batch_id"], first["baseline_batch_id"])
+        # 幂等启用不应再产生新批次
+        batches = self.client.get("/api/batches").get_json()
+        self.assertEqual(len(batches), 2)  # 1 个上传批次 + 1 个起点批次
+
+    def test_snapshot_immutable_after_later_uploads_and_restart(self):
+        self._upload(self._full_hour_csv("S1", 1000))  # 完整小时，12.0 mm
+        self._enable()
+        # 批次 3：修订整点 10:00 读数，1000 -> 995（更高修订号），首段多 5 脉冲
+        rep = self._upload(f"S1,primary,{core.iso_utc(T10)},995,2").get_json()
+        b3 = rep["batch_id"]
+
+        # 批次 4：再次修订 10:00 -> 990，又多 5 脉冲
+        rep = self._upload(f"S1,primary,{core.iso_utc(T10)},990,3").get_json()
+        b4 = rep["batch_id"]
+
+        _, r3 = self._history("S1", self.HOUR, b3)
+        _, r4 = self._history("S1", self.HOUR, b4)
+        self.assertEqual(r3["rainfall_mm"], 13.0)   # 60 + 5 脉冲
+        self.assertEqual(r4["rainfall_mm"], 14.0)   # 60 + 10 脉冲
+
+        # 重启（同库新应用实例）后，已提交批次的查询结果不变
+        app2 = create_app(self.path)
+        c2 = app2.test_client()
+        got3 = c2.get(f"/api/history?station=S1&hour={self.HOUR}&batch={b3}").get_json()
+        got4 = c2.get(f"/api/history?station=S1&hour={self.HOUR}&batch={b4}").get_json()
+        self.assertEqual(got3["rainfall_mm"], 13.0)
+        self.assertEqual(got4["rainfall_mm"], 14.0)
+        # 实时读数已前进，但历史结果不受影响
+        live = c2.get(f"/api/hourly?station=S1&hour={self.HOUR}").get_json()
+        self.assertEqual(live["rainfall_mm"], 14.0)
+
+    def test_same_key_multiple_revisions_in_one_batch_uses_final_value(self):
+        self._upload(self._full_hour_csv("S1", 1000))
+        self._enable()
+        # 同批对 10:00 两次修订：rev2 接受，再来 rev2 被拒（同修订号），rev3 接受为最终值
+        text = "\n".join([
+            f"S1,primary,{core.iso_utc(T10)},995,2",
+            f"S1,primary,{core.iso_utc(T10)},1,2",    # 同修订号 -> 拒绝
+            f"S1,primary,{core.iso_utc(T10)},990,3",  # 最终接受值
+        ])
+        rep = self._upload(text).get_json()
+        self.assertEqual(rep["accepted_count"], 2)
+        self.assertEqual(rep["rejected_count"], 1)
+        b = rep["batch_id"]
+        _, r = self._history("S1", self.HOUR, b)
+        # 最终值 990：首段 (990 -> 1001) = 11 脉冲，其余 59 段各 1，共 70 脉冲 = 14.0 mm
+        self.assertEqual(r["rainfall_mm"], 14.0)
+
+    def test_failed_batch_rolls_back_history_and_does_not_change_prior_result(self):
+        self._upload(self._full_hour_csv("S1", 1000))
+        self._enable()
+        # 用小时窗口外的键（09:00）做一次成功修订，避免改动 10 点小时的端点
+        good_resp = self._upload(f"S1,primary,{core.iso_utc(T09)},900,2").get_json()
+        good_batch = good_resp["batch_id"]
+
+        # 直接构造违反 CHECK 的设备值，触发事务回滚
+        bad = core.Reading("S1", "tertiary", T10 + 120, 5, 1)
+        conn = db.connect(self.path)
+        try:
+            with self.assertRaises(sqlite3.Error):
+                db.apply_batch(conn, [(1, "bad", bad)], [], "bad.csv")
+        finally:
+            conn.close()
+
+        # 回滚不留批次、不留快照（good_batch 之后的批次号没有任何快照行）
+        conn = db.connect(self.path)
+        try:
+            self.assertEqual(
+                conn.execute("SELECT COUNT(*) FROM batches WHERE filename='bad.csv'").fetchone()[0], 0
+            )
+            self.assertEqual(
+                conn.execute(
+                    "SELECT COUNT(*) FROM reading_history WHERE batch_id>?", (good_batch,)
+                ).fetchone()[0], 0
+            )
+        finally:
+            conn.close()
+        # 已提交批次结果仍可正常查询且不变
+        status, r = self._history("S1", self.HOUR, good_batch)
+        self.assertEqual(status, 200)
+        self.assertEqual(r["rainfall_mm"], 12.0)
+
+    def test_history_uses_same_primary_backup_gap_rules_and_matches_web(self):
+        # 主计完整小时，删掉主计 10:30 端点，备计只补 10:30/10:31：
+        # 29 段缺端点不可跨设备 -> 缺失；30 段备计两端齐全 -> 备计，与实时规则完全一致
+        lines = csv_rows("S1", "primary", T10, [1000 + i for i in range(61)])
+        del lines[30]
+        lines += [
+            f"S1,backup,{core.iso_utc(T10 + 30 * 60)},500,1",
+            f"S1,backup,{core.iso_utc(T10 + 31 * 60)},504,1",
+        ]
+        self._upload("\n".join(lines))
+        info = self._enable().get_json()
+        status, r = self._history("S1", self.HOUR, info["baseline_batch_id"])
+        self.assertEqual(status, 200)
+        self.assertEqual(r["status"], "incomplete")
+        self.assertIsNone(r["rainfall_mm"])
+        self.assertEqual(r["missing_intervals"], 1)
+        self.assertEqual(r["intervals"][30]["source"], "backup")
+        # 与实时 API 完全一致
+        live = self.client.get(f"/api/hourly?station=S1&hour={self.HOUR}").get_json()
+        self.assertEqual(live, {k: v for k, v in r.items() if k not in ("batch_id", "history")})
+        # 网页与 API 一致：同样标出缺口、备计来源与不可变说明
+        html = self.client.get(
+            f"/history?station=S1&hour={self.HOUR}&batch={info['baseline_batch_id']}"
+        ).get_data(as_text=True)
+        self.assertIn("不可供数", html)
+        self.assertIn("缺口 1 / 60", html)
+        self.assertIn("不可变快照", html)
+
+    def test_history_error_handling(self):
+        self._upload(self._full_hour_csv("S1", 1000))
+        self._enable()
+        # 未知批次
+        status, body = self._history("S1", self.HOUR, 9999)
+        self.assertEqual(status, 404)
+        self.assertIn("不存在", body["error"])
+        # 小时未整点
+        resp = self.client.get(f"/api/history?station=S1&hour=2026-11-17T10:30Z&batch=1")
+        self.assertEqual(resp.status_code, 400)
+        # 缺少 batch / batch 非整数
+        resp = self.client.get(f"/api/history?station=S1&hour={self.HOUR}")
+        self.assertEqual(resp.status_code, 400)
+        resp = self.client.get(f"/api/history?station=S1&hour={self.HOUR}&batch=abc")
+        self.assertEqual(resp.status_code, 400)
+        # 缺少 station
+        resp = self.client.get(f"/api/history?hour={self.HOUR}&batch=1")
+        self.assertEqual(resp.status_code, 400)
+        # 网页缺参数提示
+        html = self.client.get("/history?station=S1").get_data(as_text=True)
+        self.assertIn("请同时填写站点、整点小时和批次号", html)
+
+    def test_all_rejected_batch_keeps_history_unchanged(self):
+        self._upload(self._full_hour_csv("S1", 1000, revision=2))
+        info = self._enable().get_json()
+        baseline = info["baseline_batch_id"]
+        # 低修订号全部被拒：批次存在但不产生任何快照键
+        rep = self._upload(f"S1,primary,{core.iso_utc(T10)},1,1").get_json()
+        self.assertEqual(rep["accepted_count"], 0)
+        stale_batch = rep["batch_id"]
+        # 该批可查询（批次号 >= 起点），结果与起点一致，不报错
+        status, r = self._history("S1", self.HOUR, stale_batch)
+        self.assertEqual(status, 200)
+        self.assertEqual(r["rainfall_mm"], 12.0)
+        _, base = self._history("S1", self.HOUR, baseline)
+        self.assertEqual(base["rainfall_mm"], 12.0)
+
+
 if __name__ == "__main__":
     unittest.main()

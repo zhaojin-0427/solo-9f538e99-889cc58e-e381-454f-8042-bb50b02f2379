@@ -29,6 +29,12 @@
 </div>
 
 <div class="card">
+  <h2>历史回溯（按批次复盘）</h2>
+  <p>查询某次上传完成后实际可用的小时雨量与每段来源；结果在批次提交后冻结，后续上传、失败或重启均不改写。</p>
+  <p><a href="{{ url_for('history_html') }}"><button type="button">进入历史回溯查询</button></a></p>
+</div>
+
+<div class="card">
   <h2>站点数据</h2>
   {% if stations %}
   <table>
