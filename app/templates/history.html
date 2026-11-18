@@ -1,0 +1,70 @@
+{% extends "base.html" %}
+{% block title %}历史批次查询{% endblock %}
+{% block content %}
+<div class="card">
+  <h2>历史批次查询</h2>
+  {% if not status.enabled %}
+  <p><span class="badge warn">未启用</span>
+     历史查询尚未启用，启用前的旧批次<b>无法回溯</b>。</p>
+  <p>启用时将以当前有效读数建立历史起点，此后每批被接受的修订都会随该批一同提交为快照，
+     可按批次查询当时实际可用的小时雨量与每段来源。启用操作不可撤销，起点也不会被后续读数改写。</p>
+  <form method="post" action="{{ url_for('history_enable_html') }}">
+    <button type="submit">启用历史查询（以当前有效读数建立起点）</button>
+  </form>
+  {% else %}
+  <p><span class="badge ok">已启用</span>
+     起点时间 {{ status.established_at }} ｜ 基线读数 {{ status.baseline_readings }} 条 ｜
+     启用时最后批次 #{{ status.enabled_after_batch_id }}</p>
+  <p class="muted">可回溯批次：{% if status.tracked_batches %}#{{ status.first_tracked_batch }} ~ #{{ status.last_tracked_batch }}（共 {{ status.tracked_batches }} 批）
+     {% else %}暂无{% endif %}。
+     批次号 ≤ #{{ status.enabled_after_batch_id }} 的旧批次早于启用起点，无法回溯。</p>
+  {% endif %}
+</div>
+
+{% if status.enabled %}
+<div class="card">
+  <h2>按站点、UTC 整点小时与批次号查询</h2>
+  <form method="get" action="{{ url_for('report_html') }}">
+    <label>站点 <input type="text" name="station" value="{{ station }}" required></label>
+    <label>整点小时（UTC） <input type="datetime-local" name="hour" value="{{ hour }}" step="3600" required></label>
+    <label>批次号 <input type="number" name="batch" value="{{ batch }}" min="1" required></label>
+    <button type="submit">查询该批次当时结果</button>
+  </form>
+  <p class="muted">等效 API：<code>GET /api/hourly?station=站点&amp;hour=2026-11-17T10:00Z&amp;batch=批次号</code>
+     （与网页同一计算入口，结果一致）。不填批次号即为当前实时结果。</p>
+</div>
+
+<div class="card">
+  <h2>可回溯批次</h2>
+  {% if batches %}
+  <table>
+    <tr><th>批次</th><th>时间 (UTC)</th><th>文件名</th><th>接受</th><th>拒绝</th><th>被接受修订</th><th></th></tr>
+    {% for b in batches %}
+    <tr>
+      <td>#{{ b.batch_id }}</td><td>{{ b.uploaded_at }}</td><td>{{ b.filename or "（粘贴文本）" }}</td>
+      <td>{{ b.accepted_rows }}</td><td>{{ b.rejected_rows }}</td><td>{{ b.snapshot_rows }}</td>
+      <td><a href="{{ url_for('batch_detail', batch_id=b.batch_id) }}">明细</a></td>
+    </tr>
+    {% endfor %}
+  </table>
+  {% else %}<p class="muted">启用后尚无新批次，暂无快照。</p>{% endif %}
+</div>
+
+{% if old_batches %}
+<div class="card">
+  <h2>未启用历史查询的旧批次</h2>
+  <p class="muted">以下批次早于启用起点，无法回溯当时结果；如需判断某批次影响，请以之后最近的可回溯批次查询。</p>
+  <table>
+    <tr><th>批次</th><th>时间 (UTC)</th><th>文件名</th><th>接受</th><th>拒绝</th></tr>
+    {% for b in old_batches %}
+    <tr>
+      <td>#{{ b.batch_id }}</td><td>{{ b.uploaded_at }}</td><td>{{ b.filename or "（粘贴文本）" }}</td>
+      <td>{{ b.accepted_rows }}</td><td>{{ b.rejected_rows }}</td>
+    </tr>
+    {% endfor %}
+  </table>
+</div>
+{% endif %}
+{% endif %}
+<p><a href="{{ url_for('index') }}">返回首页</a></p>
+{% endblock %}

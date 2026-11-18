@@ -1,8 +1,9 @@
 """Flask 网页与查询 API。
 
-网页展示与 API 使用同一个 compute_hour_result()，保证两边结果一致；
-小时雨量由 readings 表现算现算，补传/修订整点读数提交后，
-前后两小时立即同时反映新值，不存在缓存不一致。
+网页展示与 API 使用同一个 compute_hour_result()，保证两边结果一致。
+两种查询模式：
+- 实时（未指定批次）：由 readings 表现算，反映当前最新读数；
+- 历史（指定批次）：由该批次提交完成时的快照回放，此后上传/失败/重启都不改写。
 """
 from __future__ import annotations
 
@@ -44,9 +45,73 @@ def create_app(db_path: str | None = None) -> Flask:
         return core.iso_utc(int(epoch))
 
     def compute_hour_result(station: str, hour_epoch: int) -> dict:
-        """网页与 API 共用的小时计算入口。"""
+        """网页与 API 共用的实时小时计算入口。"""
         counters = db.fetch_hour_counters(get_conn(), station, hour_epoch)
         return core.compute_hour(counters, station, hour_epoch)
+
+    def _batch_param() -> str:
+        """接受 batch / batch_id 两种参数名。"""
+        return (request.args.get("batch") or request.args.get("batch_id") or "").strip()
+
+    def resolve_hour_query(station: str, hour_epoch: int, batch_text: str) -> dict:
+        """实时或历史（按批次）查询，网页与 API 共用。
+
+        返回 {"mode": "live"|"historical", "result": {...}, "batch": {...}|None}。
+        历史查询不可回答时抛 core.HistoricalQueryError。
+        """
+        batch_text = (batch_text or "").strip()
+        if not batch_text:
+            return {"mode": "live", "result": compute_hour_result(station, hour_epoch),
+                    "batch": None}
+
+        try:
+            batch_id = int(batch_text)
+            if batch_id < 1:
+                raise ValueError
+        except ValueError:
+            raise core.HistoricalQueryError(
+                "bad_batch", f"批次号无效: {batch_text!r}"
+            ) from None
+
+        conn = get_conn()
+        status = db.get_history_status(conn)
+        if not status["enabled"]:
+            raise core.HistoricalQueryError(
+                "history_disabled",
+                "历史批次查询尚未启用，所有批次都无法回溯；"
+                "请先在“历史批次查询”页启用（以当前有效读数建立起点）",
+            )
+
+        batch = db.get_batch_meta(conn, batch_id)
+        if batch is None:
+            raise core.HistoricalQueryError(
+                "unknown_batch", f"批次 #{batch_id} 不存在", 404
+            )
+        if batch_id <= status["enabled_after_batch_id"]:
+            raise core.HistoricalQueryError(
+                "before_history",
+                f"批次 #{batch_id} 早于历史查询启用起点（{status['established_at']}，"
+                f"启用时最后批次 #{status['enabled_after_batch_id']}），无法回溯",
+            )
+
+        counters = db.fetch_batch_hour_counters(conn, batch_id, station, hour_epoch)
+        result = core.compute_hour(counters, station, hour_epoch)
+        return {
+            "mode": "historical",
+            "result": result,
+            "batch": {
+                "batch_id": batch["batch_id"],
+                "uploaded_at": batch["uploaded_at"],
+                "filename": batch["filename"],
+            },
+        }
+
+    def history_meta() -> dict:
+        conn = get_conn()
+        return {
+            "status": db.get_history_status(conn),
+            "batches": db.list_history_batches(conn),
+        }
 
     def read_upload_text():
         """从 multipart 文件或文本框读取 CSV 文本，返回 (text, filename)。"""
@@ -70,6 +135,7 @@ def create_app(db_path: str | None = None) -> Flask:
             "index.html",
             stations=db.list_stations(conn),
             batches=db.list_batches(conn),
+            history=db.get_history_status(conn),
         )
 
     @app.post("/upload")
@@ -81,35 +147,99 @@ def create_app(db_path: str | None = None) -> Flask:
             flash(f"上传失败：{exc}", "error")
             return redirect(url_for("index"))
         report = db.apply_batch(get_conn(), valid, errors, filename)
-        return render_template("batch.html", report=report)
+        return render_template(
+            "batch.html", report=report,
+            history_enabled=db.get_history_status(get_conn())["enabled"],
+        )
 
     @app.get("/report")
     def report_html():
         station = request.args.get("station", "").strip()
         hour_text = request.args.get("hour", "").strip()
+        batch_text = _batch_param()
         if not station or not hour_text:
             flash("请填写站点和整点小时", "error")
+            if batch_text:
+                return redirect(url_for("history_page", batch=batch_text))
             return redirect(url_for("index"))
         try:
             hour = core.parse_hour(hour_text)
         except ValueError as exc:
             flash(f"小时参数无效：{exc}", "error")
             return redirect(url_for("index"))
-        result = compute_hour_result(station, hour)
+        try:
+            query = resolve_hour_query(station, hour, batch_text)
+        except core.HistoricalQueryError as exc:
+            flash(str(exc), "error")
+            if batch_text:
+                return redirect(url_for("history_page", station=station,
+                                        hour=hour_text, batch=batch_text))
+            return redirect(url_for("history_page"))
+        result = query["result"]
         return render_template(
             "report.html",
             r=result,
+            batch=query["batch"],
             prev_hour=core.iso_utc(hour - core.HOUR_SECONDS),
             next_hour=core.iso_utc(hour + core.HOUR_SECONDS),
         )
 
+    @app.get("/history")
+    def history_page():
+        conn = get_conn()
+        meta = history_meta()
+        status = meta["status"]
+        old_batches = []
+        if status["enabled"]:
+            old_batches = [
+                b for b in db.list_batches(conn, limit=100)
+                if b["batch_id"] <= status["enabled_after_batch_id"]
+            ]
+        return render_template(
+            "history.html",
+            status=status,
+            batches=meta["batches"],
+            old_batches=old_batches,
+            batch=request.args.get("batch", "").strip(),
+            station=request.args.get("station", "").strip(),
+            hour=_datetime_local_value(request.args.get("hour", "")),
+        )
+
+    @app.post("/history/enable")
+    def history_enable_html():
+        info = db.enable_history(get_conn())
+        if info["already_enabled"]:
+            flash(
+                f"历史查询此前已启用（起点 {info['established_at']}，"
+                f"基线 {info['row_count']} 条读数），本次未改动起点。",
+                "info",
+            )
+        else:
+            flash(
+                f"历史查询已启用：以启用时的 {info['row_count']} 条有效读数建立起点，"
+                f"此后每批被接受的修订可按批次回溯；启用前的旧批次无法回溯。",
+                "info",
+            )
+        return redirect(url_for("history_page"))
+
     @app.get("/batches/<int:batch_id>")
     def batch_detail(batch_id):
-        batch, rows = db.get_batch(get_conn(), batch_id)
+        conn = get_conn()
+        batch, rows = db.get_batch(conn, batch_id)
         if batch is None:
             flash("批次不存在", "error")
             return redirect(url_for("index"))
-        return render_template("batch_detail.html", batch=batch, rows=rows)
+        status = db.get_history_status(conn)
+        if not status["enabled"]:
+            traceable = "disabled"
+        elif batch_id <= status["enabled_after_batch_id"]:
+            traceable = "before_history"
+        else:
+            traceable = "yes"
+        return render_template(
+            "batch_detail.html", batch=batch, rows=rows,
+            traceable=traceable, status=status,
+        )
 
     # ---------------- API（与网页同一计算入口，结果一致） ----------------
 
@@ -132,7 +262,28 @@ def create_app(db_path: str | None = None) -> Flask:
             hour = core.parse_hour(request.args.get("hour", ""))
         except ValueError as exc:
             return jsonify({"error": f"hour 参数无效: {exc}"}), 400
-        return jsonify(compute_hour_result(station, hour))
+        try:
+            query = resolve_hour_query(station, hour, _batch_param())
+        except core.HistoricalQueryError as exc:
+            return jsonify({"error": str(exc), "reason": exc.reason}), exc.status
+        # 历史模式附带批次信息；雨量、间隔来源等字段与网页完全一致
+        body = dict(query["result"])
+        body["mode"] = query["mode"]
+        body["batch"] = query["batch"]
+        return jsonify(body)
+
+    @app.post("/api/history/enable")
+    def history_enable_api():
+        info = db.enable_history(get_conn())
+        return jsonify(info)
+
+    @app.get("/api/history")
+    def history_api():
+        meta = history_meta()
+        return jsonify({
+            "status": meta["status"],
+            "batches": [dict(b) for b in meta["batches"]],
+        })
 
     @app.get("/api/stations")
     def stations_api():
@@ -158,6 +309,18 @@ def create_app(db_path: str | None = None) -> Flask:
         return "上传文件过大（上限 16MB）", 413
 
     return app
+
+
+def _datetime_local_value(text: str) -> str:
+    """把已输入的 UTC 小时回填到 datetime-local 控件所需的 YYYY-MM-DDTHH:MM。"""
+    text = (text or "").strip()
+    if not text:
+        return ""
+    try:
+        epoch = core.parse_hour(text)
+    except ValueError:
+        return text
+    return core.iso_utc(epoch)[:16]
 
 
 def _report_json(report: dict) -> dict:

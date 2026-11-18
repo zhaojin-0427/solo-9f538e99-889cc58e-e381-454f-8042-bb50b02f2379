@@ -9,6 +9,7 @@
 - 计数下降按一次 10000 回绕处理：差值 = (末读数 - 初读数) mod 10000。
 - 每脉冲折合 0.2 毫米；任一间隔无可用数据则整小时不可供数。
 - 同一（站点, 设备, 分钟）键只接受更高修订号的记录。
+- 实时与历史（按批次快照）查询共用 compute_hour()，故取值与缺口规则完全一致。
 """
 from __future__ import annotations
 
@@ -57,6 +58,18 @@ _MINUTE_RE = re.compile(
 
 class CsvFormatError(ValueError):
     """文件级 CSV 格式错误（整个文件不可用，不入库任何行）。"""
+
+
+class HistoricalQueryError(ValueError):
+    """历史批次查询无法回答（批次不存在、早于启用起点等）。
+
+    status 供 HTTP 层映射：unknown_batch -> 404，其余 -> 400。
+    """
+
+    def __init__(self, reason: str, message: str, status: int = 400):
+        super().__init__(message)
+        self.reason = reason
+        self.status = status
 
 
 @dataclass(frozen=True)

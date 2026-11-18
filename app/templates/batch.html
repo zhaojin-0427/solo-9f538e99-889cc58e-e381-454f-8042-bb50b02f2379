@@ -9,6 +9,13 @@
      {% if report.rejected_count %}<span class="badge bad">拒绝 {{ report.rejected_count }}</span>
      {% else %}<span class="badge ok">拒绝 0</span>{% endif %}</p>
   <p class="muted">本批次全部已接受行与批次记录在同一事务中写入；写入失败会整体回滚，不会留下半批新结果。</p>
+  {% if history_enabled %}
+  <p><span class="badge ok">已建立历史快照</span>
+     本批次被接受的修订已随批提交，可按批次回溯当时结果。</p>
+  {% else %}
+  <p><span class="badge warn">未启用历史查询</span>
+     启用后的上传才能按批次回溯当时结果；本批次在此之后只能查询实时值。</p>
+  {% endif %}
 </div>
 
 {% if report.rejected %}

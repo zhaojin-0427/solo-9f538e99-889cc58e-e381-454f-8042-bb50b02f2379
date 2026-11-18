@@ -1,8 +1,13 @@
 {% extends "base.html" %}
-{% block title %}小时雨量 {{ r.station }} {{ r.hour_start }}{% endblock %}
+{% block title %}小时雨量 {{ r.station }} {{ r.hour_start }}{% if batch %}（批次 #{{ batch.batch_id }}）{% endif %}{% endblock %}
 {% block content %}
 <div class="card">
-  <h2>小时雨量：{{ r.station }} @ {{ r.hour_start }}</h2>
+  <h2>小时雨量：{{ r.station }} @ {{ r.hour_start }}
+    {% if batch %}<span class="badge warn">历史批次 #{{ batch.batch_id }}</span>{% endif %}</h2>
+  {% if batch %}
+  <p class="muted">历史快照：本页结果按批次 #{{ batch.batch_id }}（{{ batch.uploaded_at }} 提交）完成时的数据计算，
+     此后上传、修订、失败或重启都不会改写。启用历史查询前的旧批次无法回溯。</p>
+  {% endif %}
   {% if r.status == "ok" %}
   <p>状态：<span class="badge ok">可供数</span>
      雨量 <strong>{{ "%.1f"|format(r.rainfall_mm) }} mm</strong>（共 {{ r.total_pulses }} 脉冲 × 0.2 mm）</p>
@@ -12,9 +17,17 @@
   {% endif %}
   <p class="muted">间隔来源：主计 {{ r.source_counts.primary }} 段 ｜ 备计 {{ r.source_counts.backup }} 段 ｜ 缺失 {{ r.source_counts.missing }} 段</p>
   <p>
+    {% if batch %}
+    <a href="{{ url_for('report_html', station=r.station, hour=prev_hour, batch=batch.batch_id) }}">← 前一小时</a> ｜
+    <a href="{{ url_for('report_html', station=r.station, hour=next_hour, batch=batch.batch_id) }}">后一小时 →</a> ｜
+    <a href="{{ url_for('hourly_api', station=r.station, hour=r.hour_start, batch=batch.batch_id) }}">JSON</a> ｜
+    <a href="{{ url_for('history_page', station=r.station, hour=r.hour_start, batch=batch.batch_id) }}">切换批次</a>
+    {% else %}
     <a href="{{ url_for('report_html', station=r.station, hour=prev_hour) }}">← 前一小时</a> ｜
     <a href="{{ url_for('report_html', station=r.station, hour=next_hour) }}">后一小时 →</a> ｜
-    <a href="{{ url_for('hourly_api', station=r.station, hour=r.hour_start) }}">JSON</a>
+    <a href="{{ url_for('hourly_api', station=r.station, hour=r.hour_start) }}">JSON</a> ｜
+    <a href="{{ url_for('history_page', station=r.station, hour=r.hour_start) }}">按批次查询历史</a>
+    {% endif %}
   </p>
 </div>
 

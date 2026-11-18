@@ -7,6 +7,16 @@
   <p>总行数 {{ batch.total_rows }} ｜
      <span class="badge ok">接受 {{ batch.accepted_rows }}</span>
      <span class="badge {{ 'bad' if batch.rejected_rows else 'ok' }}">拒绝 {{ batch.rejected_rows }}</span></p>
+  {% if traceable == "yes" %}
+  <p><span class="badge ok">可回溯</span> 本批次提交完成时的小时雨量可按批次查询：
+     <a href="{{ url_for('history_page', batch=batch.batch_id) }}">历史批次查询 →</a></p>
+  {% elif traceable == "before_history" %}
+  <p><span class="badge bad">不可回溯</span>
+     本批次早于历史查询启用起点（{{ status.established_at }}，启用时最后批次
+     #{{ status.enabled_after_batch_id }}），当时实际可用的小时雨量无法回溯。</p>
+  {% else %}
+  <p><span class="badge warn">未启用历史查询</span> 启用后可回溯此后批次的当时结果；本批次无法回溯。</p>
+  {% endif %}
 </div>
 <div class="card">
   <table>

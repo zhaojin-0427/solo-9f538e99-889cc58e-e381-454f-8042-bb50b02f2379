@@ -29,6 +29,16 @@
 </div>
 
 <div class="card">
+  <h2>历史批次查询</h2>
+  {% if history.enabled %}
+  <p><span class="badge ok">已启用</span> 起点 {{ history.established_at }}，批次 #{{ history.enabled_after_batch_id }} 之后的上传可按批次回溯。</p>
+  {% else %}
+  <p><span class="badge warn">未启用</span> 启用前的旧批次无法回溯；请先建立历史起点。</p>
+  {% endif %}
+  <p><a href="{{ url_for('history_page') }}">进入历史批次查询 →</a></p>
+</div>
+
+<div class="card">
   <h2>站点数据</h2>
   {% if stations %}
   <table>
